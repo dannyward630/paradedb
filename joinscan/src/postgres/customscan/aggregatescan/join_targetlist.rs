@@ -415,14 +415,25 @@ impl JoinAggregateTargetList {
         format!("{}__one_group", self.internal_prefix())
     }
 
-    /// DataFusion rejects a schema with a qualified and an unqualified column of
-    /// the same name, and its optimizer drops the qualifier of an aggregate
-    /// alias. So the names above stay unqualified, and get a longer prefix while
-    /// a GROUP BY column has one of them.
-    fn internal_prefix(&self) -> String {
+    /// The DataFusion name of the CTID column for a source in this plan.
+    pub fn ctid_name(&self, plan_position: usize) -> String {
+        format!("{}ctid_{plan_position}", self.internal_prefix())
+    }
+
+    /// DataFusion rejects qualified and unqualified columns with the same name,
+    /// and its optimizer drops aggregate alias qualifiers. Keep synthetic names
+    /// unqualified and extend their prefix when a group or `pdb.agg()` field
+    /// would otherwise collide with one.
+    pub fn internal_prefix(&self) -> String {
         let is_internal = |name: &str| {
             name == "__one_group"
-                || ["agg_", "row_", "win_", "precombine_"].iter().any(|kind| {
+                || ["agg_", "row_", "win_", "precombine_", "ctid_"]
+                    .iter()
+                    .any(|kind| {
+                        name.strip_prefix(kind)
+                            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    })
+                || ["__pdb_k", "__pdb_m"].iter().any(|kind| {
                     name.strip_prefix(kind)
                         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
                 })
@@ -430,6 +441,11 @@ impl JoinAggregateTargetList {
         let mut prefix = String::new();
         while self.group_columns.iter().any(|gc| {
             gc.field_name
+                .strip_prefix(prefix.as_str())
+                .is_some_and(is_internal)
+        }) || self.pdb_agg_field_refs().any(|field| {
+            field
+                .field_name
                 .strip_prefix(prefix.as_str())
                 .is_some_and(is_internal)
         }) {

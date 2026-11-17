@@ -61,13 +61,13 @@ use crate::postgres::customscan::datafusion::translator::{
     ColumnMapper, PredicateTranslator, apply_join_level_filter, apply_relnode_unnest,
     build_join_df_with_filter, make_col, make_source_col, unnest_plan_column,
 };
+use crate::postgres::customscan::joinscan::ScoreColumn;
 use crate::postgres::customscan::joinscan::build::{
     JoinSource, LateralUnnestInfo, RelNode, RelationAlias,
 };
 use crate::postgres::customscan::joinscan::scan_state::{
     create_datafusion_session_context, optimize_logical_plan, register_source_table,
 };
-use crate::postgres::customscan::joinscan::{CtidColumn, ScoreColumn};
 use crate::postgres::customscan::limit_offset::{LimitClauseKind, LimitOffset};
 use crate::postgres::customscan::pg_expr_udf::InputDecode;
 use crate::scan::PgSearchTableProvider;
@@ -134,6 +134,7 @@ pub async fn build_join_aggregate_plan(
     mpp_manifests: Option<&[SearchIndexManifest]>,
 ) -> Result<JoinAggregatePlan> {
     // Step 1: Build the join DataFrame from the RelNode tree
+    let internal_prefix = targetlist.internal_prefix();
     let df = build_relnode_df(
         ctx,
         plan,
@@ -143,6 +144,7 @@ pub async fn build_join_aggregate_plan(
         expr_context,
         planstate,
         mpp_manifests,
+        &internal_prefix,
     )
     .await?;
 
@@ -150,11 +152,16 @@ pub async fn build_join_aggregate_plan(
     // order for all of them makes them read the same row, which matters when an
     // expression above uses more than one. With an order, `first_value` also has
     // a groups accumulator, which keeps its state small enough to spill.
+    let ctid_names: std::collections::HashSet<String> = plan
+        .sources()
+        .into_iter()
+        .map(|source| targetlist.ctid_name(source.plan_position))
+        .collect();
     let row_order: Vec<Sort> = df
         .schema()
         .fields()
         .iter()
-        .filter(|field| CtidColumn::try_from(field.name().as_str()).is_ok())
+        .filter(|field| ctid_names.contains(field.name()))
         .map(|field| col(field.name()).sort(true, false))
         .collect();
 
@@ -386,6 +393,7 @@ pub async fn build_join_aggregate_plan(
             &pdb_filters,
             having_expr,
             plan,
+            &internal_prefix,
         )?,
         None => {
             // Deliberately *not* `DataFrame::aggregate`: that hardcodes
@@ -581,6 +589,7 @@ fn build_pdb_aggregate_plan(
     all_group_exprs: &[Expr],
     all_agg_exprs: &[Expr],
     grouping: &[Expr],
+    internal_prefix: &str,
 ) -> Result<LogicalPlan> {
     let array_keys: Vec<ArrayKeyToUnnest> = pdb_plan
         .keys
@@ -708,13 +717,13 @@ fn build_pdb_aggregate_plan(
         // 2. Key expressions (__pdb_k0, __pdb_k1, ...)
         for (k, key) in pdb_plan.keys.iter().enumerate() {
             if distinct_positions.contains(&(num_outer + k)) {
-                project_exprs.push(col(format!("__pdb_k{k}")));
+                project_exprs.push(col(format!("{internal_prefix}__pdb_k{k}")));
             } else {
                 let null_expr = Expr::Cast(Cast::new(
                     Box::new(lit(ScalarValue::Null)),
                     key.field.field_type.arrow_data_type(),
                 ))
-                .alias(format!("__pdb_k{k}"));
+                .alias(format!("{internal_prefix}__pdb_k{k}"));
                 project_exprs.push(null_expr);
             }
         }
@@ -806,18 +815,21 @@ fn apply_pdb_aggregate(
     pdb_filters: &HashMap<usize, Expr>,
     having_expr: Option<Expr>,
     plan: &RelNode,
+    internal_prefix: &str,
 ) -> Result<DataFrame> {
     let key_exprs: Vec<Expr> = pdb_plan
         .keys
         .iter()
         .enumerate()
-        .map(|(i, key)| pdb_key_expr(key, plan).alias(format!("__pdb_k{i}")))
+        .map(|(i, key)| pdb_key_expr(key, plan).alias(format!("{internal_prefix}__pdb_k{i}")))
         .collect();
     let metric_exprs: Vec<Expr> = pdb_plan
         .metrics
         .iter()
         .enumerate()
-        .map(|(j, metric)| pdb_metric_expr(metric, plan, pdb_filters).alias(format!("__pdb_m{j}")))
+        .map(|(j, metric)| {
+            pdb_metric_expr(metric, plan, pdb_filters).alias(format!("{internal_prefix}__pdb_m{j}"))
+        })
         .collect();
 
     let num_std_aggs = agg_exprs.len();
@@ -844,6 +856,7 @@ fn apply_pdb_aggregate(
         &all_group_exprs,
         &all_agg_exprs,
         &grouping,
+        internal_prefix,
     )?;
     let mut df = DataFrame::new(session_state, aggregated);
 
@@ -1072,6 +1085,7 @@ fn build_relnode_df<'a>(
     expr_context: Option<*mut pg_sys::ExprContext>,
     planstate: Option<*mut pg_sys::PlanState>,
     mpp_manifests: Option<&'a [SearchIndexManifest]>,
+    internal_prefix: &'a str,
 ) -> LocalBoxFuture<'a, Result<DataFrame>> {
     async move {
         match node {
@@ -1085,6 +1099,7 @@ fn build_relnode_df<'a>(
                     expr_context,
                     planstate,
                     mpp_manifests,
+                    internal_prefix,
                 )
                 .await?;
                 let alias =
@@ -1101,6 +1116,7 @@ fn build_relnode_df<'a>(
                     expr_context,
                     planstate,
                     mpp_manifests,
+                    internal_prefix,
                 )
                 .await?;
                 let right_df = build_relnode_df(
@@ -1112,6 +1128,7 @@ fn build_relnode_df<'a>(
                     expr_context,
                     planstate,
                     mpp_manifests,
+                    internal_prefix,
                 )
                 .await?;
 
@@ -1129,6 +1146,7 @@ fn build_relnode_df<'a>(
                     expr_context,
                     planstate,
                     mpp_manifests,
+                    internal_prefix,
                 )
                 .await?;
 
@@ -1429,6 +1447,7 @@ async fn build_source_df(
     expr_context: Option<*mut pg_sys::ExprContext>,
     planstate: Option<*mut pg_sys::PlanState>,
     mpp_manifests: Option<&[SearchIndexManifest]>,
+    internal_prefix: &str,
 ) -> Result<DataFrame> {
     let scan_info = source.scan_info.clone();
     let alias = RelationAlias::new(scan_info.alias.as_deref()).execution(plan_position);
@@ -1512,9 +1531,8 @@ async fn build_source_df(
     for df_field in df.schema().fields().iter() {
         let name = df_field.name();
         let expr = match fields.iter().find(|w| w.name() == *name) {
-            Some(WhichFastField::Ctid) => {
-                make_col(alias.as_str(), name).alias(CtidColumn::new(plan_position).to_string())
-            }
+            Some(WhichFastField::Ctid) => make_col(alias.as_str(), name)
+                .alias(format!("{internal_prefix}ctid_{plan_position}")),
             _ => make_col(alias.as_str(), name),
         };
         exprs.push(expr);
